@@ -1,5 +1,5 @@
 {
-  "missionLife": 0.5,
+  "missionLife": 5,
   "missionPortion": 1,
   "OBduration": 50,
   "minComp": 0,
@@ -12,9 +12,10 @@
   "coMass": 5800,
   "occulterSep": 55000,
   "skIsp": 220,
-  "defburnPortion":0.05,
+  "defburnPortion": 0.05,
   "scienceInstruments": [
-    { "name": "imager",
+    {
+      "name": "imager",
       "QE": 0.72,
       "FoV": 9.5,
       "pixelNumber": 1024,
@@ -25,7 +26,8 @@
       "texp": 30,
       "ENF": 1.41
     },
-    { "name": "spectro",
+    {
+      "name": "spectro",
       "QE": 0.72,
       "FoV": 1,
       "pixelNumber": 76,
@@ -39,7 +41,8 @@
     }
   ],
   "starlightSuppressionSystems": [
-    { "name": "occulter",
+    {
+      "name": "occulter",
       "occulter": true,
       "lam": 565,
       "BW": 0.10,
@@ -52,7 +55,8 @@
     }
   ],
   "observingModes": [
-    { "instName": "imager",
+    {
+      "instName": "imager",
       "systName": "occulter",
       "detectionMode": true
     },
@@ -72,7 +76,7 @@
     "Observatory": "WFIRSTObservatoryL2",
     "TimeKeeping": " ",
     "PostProcessing": " ",
-    "Completeness": "GarrettCompleteness",
+    "Completeness": "BrownCompleteness",
     "TargetList": " ",
     "SimulatedUniverse": "KeplerLikeUniverse",
     "SurveySimulation": "linearJScheduler",
