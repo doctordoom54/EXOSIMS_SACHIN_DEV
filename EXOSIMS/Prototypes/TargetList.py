@@ -1,27 +1,29 @@
-from EXOSIMS.util.vprint import vprint
-from EXOSIMS.util.get_module import get_module
-from EXOSIMS.util.get_dirs import get_cache_dir
-from EXOSIMS.util.deltaMag import deltaMag
-from EXOSIMS.util.getExoplanetArchive import getExoplanetArchiveAliases
-from EXOSIMS.util.utils import genHexStr
+import copy
+import gzip
+import json
+import os.path
+import pickle
+import warnings
+from pathlib import Path
+
+import astropy.units as u
+import numpy as np
+import pkg_resources
+from astropy.coordinates import SkyCoord
+from astropy.time import Time
 from MeanStars import MeanStars
 from synphot import Observation, SourceSpectrum, SpectralElement
+from synphot.exceptions import DisjointError, SynphotError
 from synphot.models import BlackBodyNorm1D
 from synphot.units import VEGAMAG
-from synphot.exceptions import DisjointError
-import numpy as np
-import astropy.units as u
-from astropy.time import Time
-from astropy.coordinates import SkyCoord
-import os.path
-import json
-from pathlib import Path
 from tqdm import tqdm
-import pickle
-import pkg_resources
-import warnings
-import gzip
-import copy
+
+from EXOSIMS.util.deltaMag import deltaMag
+from EXOSIMS.util.get_dirs import get_cache_dir
+from EXOSIMS.util.get_module import get_module
+from EXOSIMS.util.getExoplanetArchive import getExoplanetArchiveAliases
+from EXOSIMS.util.utils import genHexStr
+from EXOSIMS.util.vprint import vprint
 
 
 class TargetList(object):
@@ -94,11 +96,24 @@ class TargetList(object):
         scaleWAdMag (bool):
             If True, rescale int_dMag and int_WA for all stars based on luminosity and
             to ensure that WA is within the IWA/OWA. Defaults False.
-        int_dMag_offset (float):
-            Offset applied to int_dMag when scaleWAdMag is True.
         popStars (list, optional):
             Remove given stars (by exact name matching) from target list.
             Defaults None.
+        cherryPickStars (list, optional):
+            Before doing any other filtering, filter out all stars from input star
+            catalog *excep* for the ones in this list (by exact name matching).
+            Defaults None (do not initially filter out any stars from the star catalog).
+        skipSaturationCalcs (bool):
+            If True, do not perform any new calculations for saturation dMag and
+            saturation completeness (cached values will still be loaded if found on
+            disk).  The saturation_dMag and saturation_comp will all be set to NaN if
+            this keyword is set True and no cached values are found.  No cache will
+            be written in that case. Defaults False.
+        massLuminosityRelationship(str):
+            String describing the mass-luminsoity relaitonship to use to populate
+            stellar masses when not provided by the star catalog.
+            Defaults to Henry1993.
+            Allowable values: [Henry1993, Fernandes2021, Henry1993+1999, Fang2010]
         **specs:
             :ref:`sec:inputspec`
 
@@ -123,13 +138,13 @@ class TargetList(object):
             Boolean flagged by ``filter_for_char`` or ``earths_only``
         catalog_atts (list):
             All star catalog attributes that were copied in
+        cherryPickStars (list):
+            List of star names to keep from input star catalog (all others are filtered
+            out prior to any other filtering).
         Completeness (:ref:`Completeness`):
             :ref:`Completeness` object
         coords (astropy.coordinates.sky_coordinate.SkyCoord):
             Target coordinates
-        default_mode (dict):
-            :ref:`OpticalSystem` observingMode dictionary.  Either the detection mode
-            (default) or first characterization mode (if ``filter_for_char`` is True).
         diameter (astropy.units.quantity.Quantity):
             Stellar diameter in angular units.
         dist (astropy.units.quantity.Quantity):
@@ -151,6 +166,10 @@ class TargetList(object):
         filterBinaries (bool):
             Remove all binary stars or stars with known close companions from target
             list.
+        filter_mode (dict):
+            :ref:`OpticalSystem` observingMode dictionary. The observingMode used for
+            target filtering.  Either the detection mode (default) or first
+            characterization mode (if ``filter_for_char`` is True).
         getKnownPlanets (bool):
             Grab the list of known planets and target aliases from the NASA Exoplanet
             Archive
@@ -159,8 +178,6 @@ class TargetList(object):
             if attribute ``getKnownPlanets`` is True. Otherwise all entries are False.
         Hmag (numpy.ndarray):
             H band magnitudes
-        I (astropy.units.quantity.Quantity):
-            Inclinations of target system orbital planes
         Imag (numpy.ndarray):
             I band magnitudes
         int_comp (numpy.ndarray):
@@ -169,8 +186,6 @@ class TargetList(object):
         int_dMag (numpy.ndarray):
              :math:`\Delta{\\textrm{mag}}` used for default observation integration time
              calculation
-        int_dMag_offset (int):
-            Offset applied to int_dMag when scaleWAdMag is True.
         int_tmin (astropy.units.quantity.Quantity):
             Integration times corresponding to `int_dMag` with global minimum local zodi
             contribution.
@@ -190,6 +205,9 @@ class TargetList(object):
             K band mangitudes
         L (numpy.ndarray):
             Luminosities in solar luminosities (linear scale!)
+        massLuminosityRealtionship (str):
+            String describing the mass-luminosity relationship used to populate
+            the stellar masses when not provided by the star catalog.
         ms (MeanStars.MeanStars.MeanStars):
             MeanStars object
         MsEst (astropy.units.quantity.Quantity):
@@ -202,6 +220,8 @@ class TargetList(object):
             Target names (str array)
         nStars (int):
             Number of stars currently in target list
+        systemOmega (astropy.units.quantity.Quantity):
+            Base longitude of the ascending node for target system orbital planes
         OpticalSystem (:ref:`OpticalSystem`):
             :ref:`OpticalSystem` object
         parx (astropy.units.quantity.Quantity):
@@ -232,6 +252,11 @@ class TargetList(object):
         scaleWAdMag (bool):
             Rescale int_dMag and int_WA for all stars based on luminosity and to ensure
             that WA is within the IWA/OWA.
+        skipSaturationCalcs (bool):
+            If True (default), saturation dMag and saturation completeness are not
+            computed. If cached values exist, they will be loaded, otherwise
+            saturation_dMag and saturation_comp will all be set to NaN.  No new cache
+            files will be written for these values.
         Spec (numpy.ndarray):
             Spectral type strings. Will be strictly in G0V format.
         specdict (dict):
@@ -263,6 +288,8 @@ class TargetList(object):
         staticStars (bool):
             Do not apply proper motions to stars.  Stars always at mission start time
             positions.
+        systemInclination (astropy.units.quantity.Quantity):
+            Inclinations of target system orbital planes
         Teff (astropy.units.Quantity):
             Stellar effective temperature.
         template_spectra (dict):
@@ -294,11 +321,12 @@ class TargetList(object):
         int_WA=None,
         int_dMag=25,
         scaleWAdMag=False,
-        int_dMag_offset=1,
         popStars=None,
+        cherryPickStars=None,
+        skipSaturationCalcs=True,
+        massLuminosityRelationship="Henry1993",
         **specs,
     ):
-
         # start the outspec
         self._outspec = {}
 
@@ -321,12 +349,31 @@ class TargetList(object):
         self.filter_for_char = bool(filter_for_char)
         self.earths_only = bool(earths_only)
         self.scaleWAdMag = bool(scaleWAdMag)
-        self.int_dMag_offset = float(int_dMag_offset)
+        self.skipSaturationCalcs = bool(skipSaturationCalcs)
+        self.massLuminosityRelationship = str(massLuminosityRelationship)
+        allowable_massLuminosityRelationships = [
+            "Henry1993",
+            "Fernandes2021",
+            "Henry1993+1999",
+            "Fang2010",
+        ]
+
+        assert (
+            self.massLuminosityRelationship in allowable_massLuminosityRelationships
+        ), (
+            "massLuminosityRelationship must be one of: "
+            f"{','.join(allowable_massLuminosityRelationships)}"
+        )
 
         # list of target names to remove from targetlist
         if popStars is not None:
             assert isinstance(popStars, list), "popStars must be a list."
         self.popStars = popStars
+
+        # list of target names to keep in targetlist
+        if cherryPickStars is not None:
+            assert isinstance(cherryPickStars, list), "cherryPickStars must be a list."
+        self.cherryPickStars = cherryPickStars
 
         # populate outspec
         for att in self.__dict__:
@@ -384,19 +431,31 @@ class TargetList(object):
             self.PlanetPopulation = self.Completeness.PlanetPopulation
             self.PlanetPhysicalModel = self.Completeness.PlanetPhysicalModel
 
-        # identify default detection mode
+        # identify the observingMode to use for target filtering
         detmode = list(
             filter(
                 lambda mode: mode["detectionMode"], self.OpticalSystem.observingModes
             )
         )[0]
+        if self.filter_for_char or self.earths_only:
+            mode = list(
+                filter(
+                    lambda mode: "spec" in mode["inst"]["name"],
+                    self.OpticalSystem.observingModes,
+                )
+            )[0]
+            self.calc_char_int_comp = True
+        else:
+            mode = detmode
+            self.calc_char_int_comp = False
+        self.filter_mode = mode
 
         # Define int_WA if None provided
         if int_WA is None:
             int_WA = (
-                2.0 * detmode["IWA"]
-                if np.isinf(detmode["OWA"])
-                else (detmode["IWA"] + detmode["OWA"]) / 2.0
+                2.0 * self.filter_mode["IWA"]
+                if np.isinf(self.filter_mode["OWA"])
+                else (self.filter_mode["IWA"] + self.filter_mode["OWA"]) / 2.0
             )
             int_WA = int_WA.to("arcsec")
 
@@ -425,6 +484,18 @@ class TargetList(object):
                     "%d targets remain after removing requested targets." % self.nStars
                 )
 
+        # if cherry-picking stars, filter out all the rest
+        if self.cherryPickStars is not None:
+            keep = np.zeros(self.nStars, dtype=bool)
+
+            for n in self.cherryPickStars:
+                keep[self.Name == n] = True
+
+            self.revise_lists(np.where(keep)[0])
+
+            if self.explainFiltering:
+                print("%d targets remain after cherry-picking targets." % self.nStars)
+
         # populate spectral types and, if requested, attempt to fill in any crucial
         # missing bits of information
         self.fillPhotometryVals()
@@ -448,7 +519,10 @@ class TargetList(object):
         self.stellar_mass()
         self.stellar_diameter()
         # Calculate Star System Inclinations
-        self.I = self.gen_inclinations(self.PlanetPopulation.Irange)
+        self.systemInclination = self.gen_inclinations(self.PlanetPopulation.Irange)
+
+        # Calculate common Star System longitude of the ascending node
+        self.systemOmega = self.gen_Omegas(self.PlanetPopulation.Orange)
 
         # create placeholder array black-body spectra
         # (only filled if any modes require it)
@@ -467,6 +541,36 @@ class TargetList(object):
 
         # apply any requested additional filters
         self.filter_target_list(**specs)
+
+        # if we're doing filter_for_char, then that means that we haven't computed the
+        # star fluxes for the detection mode.  Let's do that now (post-filtering to
+        # limit the number of calculations
+        if self.filter_for_char or self.earths_only:
+            fname = (
+                f"TargetList_{self.StarCatalog.__class__.__name__}_"
+                f"nStars_{self.nStars}_mode_{detmode['hex']}.star_fluxes"
+            )
+            star_flux_path = Path(self.cachedir, fname)
+            if star_flux_path.exists():
+                with open(star_flux_path, "rb") as f:
+                    self.star_fluxes[detmode["hex"]] = pickle.load(f)
+                self.vprint(f"Loaded star fluxes values from {star_flux_path}")
+            else:
+                _ = self.starFlux(np.arange(self.nStars), detmode)
+                with open(star_flux_path, "wb") as f:
+                    pickle.dump(self.star_fluxes[detmode["hex"]], f)
+                    self.vprint(f"Star fluxes stored in {star_flux_path}")
+
+            # remove any zero-flux vals
+            if np.any(self.star_fluxes[detmode["hex"]].value == 0):
+                keepinds = np.where(self.star_fluxes[detmode["hex"]].value != 0)[0]
+                self.revise_lists(keepinds)
+                if self.explainFiltering:
+                    print(
+                        (
+                            "{} targets remain after removing those with zero flux. "
+                        ).format(self.nStars)
+                    )
 
         # get target system information from exopoanet archive if requested
         if self.getKnownPlanets:
@@ -494,9 +598,9 @@ class TargetList(object):
             self.starprop_static = (
                 lambda sInds, currentTime, eclip=False, c1=self.starprop(
                     allInds, missionStart, eclip=False
-                ), c2=self.starprop(allInds, missionStart, eclip=True): c1[sInds]
-                if not (eclip)  # noqa: E275
-                else c2[sInds]
+                ), c2=self.starprop(allInds, missionStart, eclip=True): (
+                    c1[sInds] if not (eclip) else c2[sInds]  # noqa: E275
+                )
             )
 
     def __str__(self):
@@ -789,43 +893,37 @@ class TargetList(object):
         ZL = self.ZodiacalLight
         PPop = self.PlanetPopulation
         Comp = self.Completeness
-        detmode = list(filter(lambda mode: mode["detectionMode"], OS.observingModes))[0]
-        if self.filter_for_char or self.earths_only:
-            mode = list(
-                filter(lambda mode: "spec" in mode["inst"]["name"], OS.observingModes)
-            )[0]
-            self.calc_char_int_comp = True
-        else:
-            mode = detmode
-            self.calc_char_int_comp = False
-        self.default_mode = mode
 
         # grab zodi vals for any required calculations
         sInds = np.arange(self.nStars)
-        fZminglobal = ZL.global_zodi_min(mode)
+        fZminglobal = ZL.global_zodi_min(self.filter_mode)
         fZ = np.repeat(fZminglobal, len(sInds))
-        fEZ = np.repeat(ZL.fEZ0, len(sInds))
+        fEZ = (
+            ZL.zodi_color_correction_factor(self.filter_mode["lam"], photon_units=True)
+            * ZL.fEZ0
+            * 10.0 ** (-0.4 * (self.MV - 4.83))
+        )
 
         # compute proj separation bounds for any required calculations
         if PPop.scaleOrbits:
-            tmp_smin = np.tan(mode["IWA"]) * self.dist / np.sqrt(self.L)
-            if np.isinf(mode["OWA"]):
+            tmp_smin = np.tan(self.filter_mode["IWA"]) * self.dist / np.sqrt(self.L)
+            if np.isinf(self.filter_mode["OWA"]):
                 tmp_smax = np.inf * self.dist
             else:
-                tmp_smax = np.tan(mode["OWA"]) * self.dist / np.sqrt(self.L)
+                tmp_smax = np.tan(self.filter_mode["OWA"]) * self.dist / np.sqrt(self.L)
         else:
-            tmp_smin = np.tan(mode["IWA"]) * self.dist
-            if np.isinf(mode["OWA"]):
+            tmp_smin = np.tan(self.filter_mode["IWA"]) * self.dist
+            if np.isinf(self.filter_mode["OWA"]):
                 tmp_smax = np.inf * self.dist
             else:
-                tmp_smax = np.tan(mode["OWA"]) * self.dist
+                tmp_smax = np.tan(self.filter_mode["OWA"]) * self.dist
 
         # 0. Regardless of whatever else we do, we're going to need stellar fluxes in
         # the relevant observing mode.  So let's just compute them now and cache them
         # for later use.
         fname = (
             f"TargetList_{self.StarCatalog.__class__.__name__}_"
-            f"nStars_{self.nStars}_mode_{mode['hex']}.star_fluxes"
+            f"nStars_{self.nStars}_mode_{self.filter_mode['hex']}.star_fluxes"
         )
         star_flux_path = Path(self.cachedir, fname)
         if star_flux_path.exists():
@@ -833,15 +931,31 @@ class TargetList(object):
                 self.star_fluxes = pickle.load(f)
             self.vprint(f"Loaded star fluxes values from {star_flux_path}")
         else:
-            _ = self.starFlux(np.arange(self.nStars), mode)
+            _ = self.starFlux(np.arange(self.nStars), self.filter_mode)
             with open(star_flux_path, "wb") as f:
                 pickle.dump(self.star_fluxes, f)
                 self.vprint(f"Star fluxes stored in {star_flux_path}")
 
+        # remove any zero-flux vals
+        if np.any(self.star_fluxes[self.filter_mode["hex"]].value == 0):
+            keepinds = np.where(self.star_fluxes[self.filter_mode["hex"]].value != 0)[0]
+            self.revise_lists(keepinds)
+            sInds = np.arange(self.nStars)
+            tmp_smin = tmp_smin[keepinds]
+            tmp_smax = tmp_smax[keepinds]
+            fZ = fZ[keepinds]
+            fEZ = fEZ[keepinds]
+            if self.explainFiltering:
+                print(
+                    ("{} targets remain after removing those with zero flux. ").format(
+                        self.nStars
+                    )
+                )
+
         # 1. Calculate the saturation dMag. This is stricly a function of
         # fZminglobal, ZL.fEZ0, self.int_WA, mode, the current targetlist
         # and the postprocessing factor
-        zodi_vals_str = f"{str(ZL.global_zodi_min(mode))} {str(ZL.fEZ0)}"
+        zodi_vals_str = f"{str(ZL.global_zodi_min(self.filter_mode))} {str(ZL.fEZ0)}"
         stars_str = (
             f"ppFact:{self.PostProcessing._outspec['ppFact']}, "
             f"fillPhotometry:{self.fillPhotometry}, "
@@ -855,7 +969,7 @@ class TargetList(object):
         fname = (
             f"TargetList_{self.StarCatalog.__class__.__name__}_"
             f"{OS.__class__.__name__}_{ZL.__class__.__name__}_"
-            f"vals_{vals_hash}_mode_{mode['hex']}"
+            f"vals_{vals_hash}_mode_{self.filter_mode['hex']}"
         )
 
         saturation_dMag_path = Path(self.cachedir, f"{fname}.sat_dMag")
@@ -864,13 +978,16 @@ class TargetList(object):
                 self.saturation_dMag = pickle.load(f)
             self.vprint(f"Loaded saturation_dMag values from {saturation_dMag_path}")
         else:
-            self.saturation_dMag = OS.calc_saturation_dMag(
-                self, sInds, fZ, fEZ, self.int_WA, mode, TK=None
-            )
+            if self.skipSaturationCalcs:
+                self.saturation_dMag = np.zeros(self.nStars) * np.nan
+            else:
+                self.saturation_dMag = OS.calc_saturation_dMag(
+                    self, sInds, fZ, fEZ, self.int_WA, self.filter_mode, TK=None
+                )
 
-            with open(saturation_dMag_path, "wb") as f:
-                pickle.dump(self.saturation_dMag, f)
-            self.vprint(f"saturation_dMag values stored in {saturation_dMag_path}")
+                with open(saturation_dMag_path, "wb") as f:
+                    pickle.dump(self.saturation_dMag, f)
+                self.vprint(f"saturation_dMag values stored in {saturation_dMag_path}")
 
         # 2. Calculate the completeness value if the star is integrated for an
         # infinite time by using the saturation dMag
@@ -899,13 +1016,16 @@ class TargetList(object):
                 self.saturation_comp = pickle.load(f)
             self.vprint(f"Loaded saturation_comp values from {saturation_comp_path}")
         else:
-            self.vprint("Calculating the saturation time completeness")
-            self.saturation_comp = Comp.comp_calc(
-                tmp_smin.to(u.AU).value, tmp_smax.to(u.AU).value, tmp_dMag
-            )
-            with open(saturation_comp_path, "wb") as f:
-                pickle.dump(self.saturation_comp, f)
-            self.vprint(f"saturation_comp values stored in {saturation_comp_path}")
+            if self.skipSaturationCalcs:
+                self.saturation_comp = np.zeros(self.nStars) * np.nan
+            else:
+                self.vprint("Calculating the saturation time completeness")
+                self.saturation_comp = Comp.comp_calc(
+                    tmp_smin.to(u.AU).value, tmp_smax.to(u.AU).value, tmp_dMag
+                )
+                with open(saturation_comp_path, "wb") as f:
+                    pickle.dump(self.saturation_comp, f)
+                self.vprint(f"saturation_comp values stored in {saturation_comp_path}")
 
         # 3. Find limiting dMag for intCutoff time. This is stricly a function of
         # OS.intCutoff, fZminglobal, ZL.fEZ0, self.int_WA, mode, and the current
@@ -916,7 +1036,7 @@ class TargetList(object):
         fname = (
             f"TargetList_{self.StarCatalog.__class__.__name__}_"
             f"{OS.__class__.__name__}_{ZL.__class__.__name__}_"
-            f"vals_{vals_hash}_mode_{mode['hex']}"
+            f"vals_{vals_hash}_mode_{self.filter_mode['hex']}"
         )
 
         intCutoff_dMag_path = Path(self.cachedir, f"{fname}.intCutoff_dMag")
@@ -929,7 +1049,7 @@ class TargetList(object):
             intTimes = np.repeat(OS.intCutoff.value, len(sInds)) * OS.intCutoff.unit
 
             self.intCutoff_dMag = OS.calc_dMag_per_intTime(
-                intTimes, self, sInds, fZ, fEZ, self.int_WA, mode
+                intTimes, self, sInds, fZ, fEZ, self.int_WA, self.filter_mode
             ).reshape((len(intTimes),))
             with open(intCutoff_dMag_path, "wb") as f:
                 pickle.dump(self.intCutoff_dMag, f)
@@ -996,15 +1116,13 @@ class TargetList(object):
             self.int_WA = ((np.sqrt(self.L) * u.AU / self.dist).decompose() * u.rad).to(
                 u.arcsec
             )
-            self.int_WA[np.where(self.int_WA > detmode["OWA"])[0]] = detmode["OWA"] * (
-                1.0 - 1e-14
-            )
-            self.int_WA[np.where(self.int_WA < detmode["IWA"])[0]] = detmode["IWA"] * (
-                1.0 + 1e-14
-            )
-            self.int_dMag = (
-                self.int_dMag - self.int_dMag_offset + 2.5 * np.log10(self.L)
-            )
+            self.int_WA[
+                np.where(self.int_WA > self.filter_mode["OWA"])[0]
+            ] = self.filter_mode["OWA"] * (1.0 - 1e-14)
+            self.int_WA[
+                np.where(self.int_WA < self.filter_mode["IWA"])[0]
+            ] = self.filter_mode["IWA"] * (1.0 + 1e-14)
+            self.int_dMag = self.int_dMag + 2.5 * np.log10(self.L)
 
         # Go through the int_dMag values and replace with limiting dMag where
         # int_dMag is higher. Since the int_dMag will never be reached if
@@ -1015,7 +1133,7 @@ class TargetList(object):
 
         # Finally, compute the nominal integration time at minimum zodi
         self.int_tmin = self.OpticalSystem.calc_intTime(
-            self, sInds, fZ, fEZ, self.int_dMag, self.int_WA, mode
+            self, sInds, fZ, fEZ, self.int_dMag, self.int_WA, self.filter_mode
         )
 
         # update catalog attributes for any future filtering
@@ -1415,33 +1533,6 @@ class TargetList(object):
             pass
         self.nStars = len(sInds)
 
-    def stellar_mass(self):
-        """Populates target list with 'true' and 'approximate' stellar masses
-
-        Approximate stellar masses are calculated from absolute magnitudes using the
-        model from [Henry1993]_. "True" masses are generated by a uniformly distributed,
-        7%-mean error term to the apprxoimate masses.
-
-        All values are in units of solar mass.
-
-        Function called by reset sim.
-
-        """
-
-        # 'approximate' stellar mass
-        self.MsEst = (
-            10.0 ** (0.002456 * self.MV**2 - 0.09711 * self.MV + 0.4365)
-        ) * u.solMass
-        # normally distributed 'error'
-        err = (np.random.random(len(self.MV)) * 2.0 - 1.0) * 0.07
-        self.MsTrue = (1.0 + err) * self.MsEst
-
-        # if additional filters are desired, need self.catalog_atts fully populated
-        if not hasattr(self.catalog_atts, "MsEst"):
-            self.catalog_atts.append("MsEst")
-        if not hasattr(self.catalog_atts, "MsTrue"):
-            self.catalog_atts.append("MsTrue")
-
     def stellar_diameter(self):
         """Populates target list with approximate stellar diameters
 
@@ -1502,6 +1593,93 @@ class TargetList(object):
                 + 1.0 / (0.92 * self.BV[sInds] + 0.62)
             )
         )
+
+    def stellar_mass(self):
+        """Populates target list with 'true' and 'approximate' stellar masses
+
+        Approximate stellar masses are calculated from absolute magnitudes using the
+        model from [Henry1993]_. "True" masses are generated by a uniformly
+        distributed, 7%-mean error term to the apprxoimate masses.
+
+        All values are in units of solar mass.
+
+        Function called by reset sim.
+
+        """
+
+        if self.massLuminosityRelationship == "Henry1993":
+            # good generalist, but out of date
+            # 'approximate' stellar mass
+            self.MsEst = (
+                10.0 ** (0.002456 * self.MV**2 - 0.09711 * self.MV + 0.4365)
+            ) * u.solMass
+            # normally distributed 'error' of 7%
+            err = (np.random.random(len(self.MV)) * 2.0 - 1.0) * 0.07
+            self.MsTrue = (1.0 + err) * self.MsEst
+
+        elif self.massLuminosityRelationship == "Fernandes2021":
+            # only good for FGK
+            # 'approximate' stellar mass without error
+            self.MsEst = (
+                10
+                ** (
+                    (0.219 * np.log10(self.L))
+                    + (0.063 * ((np.log10(self.L)) ** 2))
+                    - (0.119 * ((np.log10(self.L)) ** 3))
+                )
+            ) * u.solMass
+            # error distribution in literature as 3% in approxoimate masses
+            err = (np.random.random(len(self.L)) * 2.0 - 1.0) * 0.03
+            self.MsTrue = (1.0 + err) * self.MsEst
+
+        elif self.massLuminosityRelationship == "Henry1993+1999":
+            # more specific than Henry1993
+            # initialize MsEst attribute
+            self.MsEst = np.zeros(self.nStars)
+            for j, MV in enumerate(self.MV):
+                if 0.50 <= MV <= 2.0:
+                    mass = (10.0 ** (0.002456 * MV**2 - 0.09711 * MV + 0.4365)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.07
+                elif 0.18 <= MV < 0.50:
+                    mass = (10.0 ** (-0.1681 * MV + 1.4217)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.07
+                elif 0.08 <= MV < 0.18:
+                    mass = (10 ** (0.005239 * MV**2 - 0.2326 * MV + 1.3785)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    # 5% error desccribed in 1999 paper
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.05
+                else:
+                    # default to Henry 1993
+                    mass = (10.0 ** (0.002456 * MV**2 - 0.09711 * MV + 0.4365)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.07
+                self.MsEst[j] = mass
+            self.MsEst = self.MsEst * u.solMass
+            self.MsTrue = (1.0 + err) * self.MsEst
+
+        elif self.massLuminosityRelationship == "Fang2010":
+            # for all main sequence stars, good generalist
+            self.MsEst = np.zeros(self.nStars)
+            for j, MV in enumerate(self.MV):
+                if MV <= 1.05:
+                    mass = (10 ** (0.558 - 0.182 * MV - 0.0028 * MV**2)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.05
+                else:
+                    mass = (10 ** (0.489 - 0.125 * MV + 0.00511 * MV**2)).item()
+                    self.MsEst = np.append(self.MsEst, mass)
+                    err = (np.random.random(1) * 2.0 - 1.0) * 0.07
+                self.MsEst[j] = mass
+            self.MsEst = self.MsEst * u.solMass
+            self.MsTrue = (1.0 + err) * self.MsEst
+
+        # if additional filters are desired, need self.catalog_atts fully populated
+        if not hasattr(self.catalog_atts, "MsEst"):
+            self.catalog_atts.append("MsEst")
+        if not hasattr(self.catalog_atts, "MsTrue"):
+            self.catalog_atts.append("MsTrue")
 
     def starprop(self, sInds, currentTime, eclip=False):
         """Finds target star positions vector in heliocentric equatorial (default)
@@ -1689,18 +1867,18 @@ class TargetList(object):
                     template = self.get_template_spectrum(spec_to_use)
 
                 # renormalize the template to the band we've decided to use
-                template_renorm = template.normalize(
-                    mag_to_use * VEGAMAG,
-                    self.standard_bands[band_to_use],
-                    vegaspec=self.OpticalSystem.vega_spectrum,
-                )
-
-                # finally, write the result back to the star_fluxes
                 try:
+                    template_renorm = template.normalize(
+                        mag_to_use * VEGAMAG,
+                        self.standard_bands[band_to_use],
+                        vegaspec=self.OpticalSystem.vega_spectrum,
+                    )
+
+                    # finally, write the result back to the star_fluxes
                     self.star_fluxes[mode["hex"]][sInd] = Observation(
                         template_renorm, mode["bandpass"], force="taper"
                     ).integrate()
-                except DisjointError:
+                except (DisjointError, SynphotError):
                     self.star_fluxes[mode["hex"]][sInd] = 0 * (u.ph / u.s / u.m**2)
 
         return self.star_fluxes[mode["hex"]][sInds]
@@ -1728,7 +1906,8 @@ class TargetList(object):
         return starRadius * u.R_sun
 
     def gen_inclinations(self, Irange):
-        """Randomly Generate Inclination of Target System Orbital Plane
+        """Randomly Generate Inclination of Target System Orbital Plane for
+        all stars in the target list
 
         Args:
             Irange (~numpy.ndarray(float)):
@@ -1742,6 +1921,27 @@ class TargetList(object):
         return (
             np.arccos(np.cos(Irange[0]) - 2.0 * C * np.random.uniform(size=self.nStars))
         ).to("deg")
+
+    def gen_Omegas(self, Orange):
+        """Randomly Generate longitude of the ascending node of target system
+        orbital planes for all stars in the target list
+
+        Args:
+            Orange (~numpy.ndarray(float)):
+                The range to generate Omegas over
+
+        Returns:
+            ~astropy.units.Quantity(~numpy.ndarray(float)):
+                System Omegas
+        """
+        return (
+            np.random.uniform(
+                low=Orange[0].to(u.deg).value,
+                high=Orange[1].to(u.deg).value,
+                size=self.nStars,
+            )
+            * u.deg
+        )
 
     def calc_HZ_inner(
         self,
